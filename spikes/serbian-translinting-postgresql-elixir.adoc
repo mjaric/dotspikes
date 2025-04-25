@@ -48,8 +48,8 @@ The tekstovi table now has several rows where the text is entered in Cyrillic. F
 - id=4: "Кућа на селу је веома пространа."
 - id=5: "Људи воле музику и игру."
 
-[NOTE,title="Note"]
-In these examples, we use simple sentences for illustration. In a real scenario, the text may be longer or more complex.
+
+NOTE: In these examples, we use simple sentences for illustration. In a real scenario, the text may be longer or more complex.
 
 == Solution through Transliteration (Cyrillic - Latin)
 
@@ -89,8 +89,8 @@ Explanation:
 . Then we replace specific Cyrillic letters: **љ, њ, џ** with their two-letter Latin equivalents (*lj, nj, dž*). We do this before the translate function because translate performs character-by-character mapping and cannot directly produce multiple letters from one.
 . Finally, we use `TRANSLATE` to replace the remaining Cyrillic letters with their Latin counterparts. In the above example, all standard letters of the Serbian Cyrillic script are covered: e.g. `'д'->'d'`, `'ђ'->'đ'`, `'ж'->'ž'`, `'ч'->'č'`, `'ш'->'š'`, `'ћ'->'ć'`, etc. This gives us the Latin text.
 
-[NOTE,title="Note"]
-The function is marked as IMMUTABLE because it always returns the same output for a given input, which allows its use in indexes.
+
+NOTE: The function is marked as IMMUTABLE because it always returns the same output for a given input, which allows its use in indexes.
 
 == Example Query: Substring Search with `ILIKE` and Transliteration
 
@@ -111,7 +111,7 @@ Result: this query will find rows where the Cyrillic string "град" appears. 
 - id=1: "Београд је главни *град* Србије."
 - id=2: "Нови Сад је drugi po величини *град*."
 
-(This works because both the data and the query are in Cyrillic, so the comparison can be done directly.)
+TIP: This works because both the data and the query are in Cyrillic, so the comparison can be done directly.
 
 .(b) Search with Latin query using transliteration:
 
@@ -172,10 +172,10 @@ USING gin ( cyrillic_to_latin(cyrillic_content) gin_trgm_ops );
 
 This index stores trigrams (three-letter groups) of the Latin text. Now a query with `ILIKE` can use this index. Instead of an expensive sequential scan of all rows, PostgreSQL will quickly find candidates containing the requested substring through the trigram index. This drastically improves performance on larger datasets – a simple `ILIKE` is easy to implement but doesn't scale well https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Full[promer], while the trigram index significantly speeds up such searches https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Creating%20a%20trigram%20index%20can,query[primer].
 
-[NOTE,title="Example"]
+[TIP]
 After creating the index, the query (b) above would internally use a Bitmap Index Scan over the trigram index instead of a Seq Scan. For a very large table, the difference can be from scanning a million rows to scanning a few thousand candidates.
 
-[NOTE,title="Note"]
+[NOTE]
 `pg_trgm` index works for Unicode text (Cyrillic, Latin, it doesn't matter, it just looks at byte sequences). In our case, we insist on transliteration to have a single script in the index. We could have also indexed the Cyrillic text directly with trigram (then the Latin query would have to be first transliterated to Cyrillic, which is more complex due to possible ambiguities). A unique strategy of transliterating everything to Latin has proven to be simpler.
 
 == Removing Diacritics (`unaccent`)
@@ -188,7 +188,7 @@ To use it, let's enable it:
 CREATE EXTENSION unaccent;
 ----
 
-`unaccent` function converts, for example, "č" to "c", "š" to "s", "đ" to "dj" (or "d", depending on the rules), etc. We can incorporate `unaccent` into our transliteration function or into the query itself. For example:
+The `unaccent` function converts, for example, "č" to "c", "š" to "s", "đ" to "dj" (or "d", depending on the rules), etc. We can incorporate `unaccent` into our transliteration function or into the query itself. For example:
 
 [source,sql]
 ----
@@ -339,7 +339,7 @@ Limitations specific to the Serbian language:
 
 Since the PoC is realized at the PostgreSQL level, integration into an Elixir application (with Ecto ORM) can be achieved with a few recommendations:
 
-.Creation of extensions and functions through migrations:
+=== Creation of extensions and functions through migrations
 In Ecto migrations, you can add steps to create the necessary extensions (`unaccent`, `pg_trgm`) and create the function `cyrillic_to_latin`. For example, in the migration file add
 
 [source,elixir]
@@ -350,21 +350,25 @@ execute(\"""
   CREATE OR REPLACE FUNCTION public.cyrillic_to_latin(p_text TEXT)
   RETURNS TEXT AS $$
   BEGIN
-    -- ... function body ...
+    --  function body here ...
   END; $$ LANGUAGE plpgsql IMMUTABLE;
 \""")
 ----
+
 Ensure that the function is created in the correct schema (we used public in the above example).
 
-.Adding columns/indexes in migrations
+=== Adding columns/indexes in migrations
+
 If we go the route of an additional column for transliteration (`sadrzaj_lat` TEXT) and TSVECTOR column, the migration should add that. Also create indexes:
+
 [source,elixir]
 ----
 create index("tekstovi", ["cyrillic_to_latin(cyrillic_content) gin_trgm_ops"], name: "idx_tekst_lat_trgm", using: "GIN")
 create index("tekstovi", ["tsv"], name: "idx_tekst_tsv", using: "GIN")
 ----
 
-.Updating columns through the application
+=== Updating columns through the application
+
 If we use a materialized column `sadrzaj_lat` and `tsv`, it is necessary that with every change to `sadrzaj_cirilic` we automatically update these columns. We can solve this with a trigger in PG that calls the transliteration function and `to_tsvector`. Alternatively, upon insert/update from the Elixir application, we can explicitly set these columns by calling the function in SQL. For example, in Ecto we can use a fragment in the changeset:
 
 [source,elixir]
@@ -376,7 +380,8 @@ changeset
 ----
 With this approach, we rely on the database to calculate the values of the derived columns.
 
-.Usage in searches (Ecto queries)
+=== Usage in searches (Ecto queries)
+
 Ecto allows writing fragments for specific SQL parts. For example, for substring search we could have an Ecto query:
 
 [source,elixir]
@@ -399,9 +404,10 @@ Repo.all(from t in Tekstovi,
 
 ----
 
-noting that, if we want diacritic insensitivity, we can include unaccent(?) around those fragments in a similar way.
+TIP: if we want diacritic insensitivity, we can include `unaccent(?)` around those fragments in a similar way.
 
 For full-text search, Ecto fragment could look like:
+
 [source,elixir]
 ----
 Repo.all(from t in Tekstovi,
@@ -413,7 +419,7 @@ Repo.all(from t in Tekstovi,
 where `search_term` is the user input. (Of course, in practice, we might also add `unaccent` here in the definition of the TSVEKTOR index for complete coverage.)
 
 
-.Testing
+=== Testing
 
 After integration, test various search scenarios:
 
