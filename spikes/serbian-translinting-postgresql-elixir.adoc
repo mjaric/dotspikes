@@ -447,7 +447,8 @@ For a comprehensive production solution, it is recommended to:
 
 With this PoC and the outlined guidelines, the next step is implementation in the application itself. PostgreSQL shows it is "smart enough" to enable searching Cyrillic content even via Latin script, providing users with search flexibility without compromising data integrity. This solution is a good foundation that can be further built upon (e.g., by adding support for more languages or scripts if needed, or integrating with Elixir text processing before queries).
 
-References:
+[apendix]
+== References
 
 - Martin Kováčik, "How to do transliteration in PostgreSQL" – describes a requirement similar to ours (Russian Cyrillic and Latin) and proposes a function for transliteration and indexing.
 - Jarosław Orzeł, "How to build PostgreSQL full text search engine in any language" – shows examples of using ILIKE, trigram indexes, and tsearch, with performance comparison (https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Full[izvor], https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Creating%20a%20trigram%20index%20can,query[izvor], https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=,you%20should%20choose%20tsearch%20engine[izvor])
