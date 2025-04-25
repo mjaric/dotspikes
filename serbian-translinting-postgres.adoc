@@ -1,0 +1,448 @@
+= Searching Cyrillic Text Using Both Scripts (PoC in PostgreSQL)
+
+
+== Introduction and Objective
+
+In this report, we present a Proof-of-Concept (PoC) solution for searching text content entered in Serbian language using the Cyrillic script, which enables finding results by searching with both Cyrillic and Latin input. In other words, users can enter queries in either of the two Serbian scripts, and the system will find the appropriate text regardless of the original input's script. For example, searching for "Београд" or "Beograd" should return the same result. Such a requirement arises, for example, when a search for "Москва" is expected to yield the same outcome as "Moskva," i.e., to search both the Cyrillic record and its transliteration.
+
+*Problem*: PostgreSQL does not have built-in direct transliteration between scripts, so we need to devise a way to bridge this gap. Additionally, we want to support two search modes:
+
+* _Substring search_ – finding a text substring (e.g., using ILIKE) regardless of script.
+* _Full-text search_ – indexed search by keyword (lexeme) with support for both scripts.
+
+Through this PoC we will:
+
+. Define a simple table with text entered in Cyrillic.
+. Show how search works with both Cyrillic and Latin input, using transliteration.
+. Support both substring search and full-text search with appropriate SQL examples.
+. Consider using PostgreSQL extensions such as unaccent, pg_trgm and text search (FTS) to improve the system.
+. Discuss performance and limitations of different approaches.
+. Provide recommendations for next steps toward integrating the solution into an Elixir application.
+
+Example Table with Cyrillic Text
+
+For demonstration purposes, let's create a simple table tekstovi with an identifier and a field for content in Cyrillic. We will populate it with a few examples of Serbian text in Cyrillic script:
+
+[source,sql]
+----
+-- 1. Create table
+CREATE TABLE tekstovi (
+    id SERIAL PRIMARY KEY,
+    cyrillic_content TEXT
+);
+
+-- 2. Insert a few rows of text in Cyrillic
+INSERT INTO tekstovi(cyrillic_content) VALUES
+('Београд је главни град Србије.'),
+('Нови Сад је други по величини град.'),
+('Ниш је познат по Нишкој тврђави.'),
+('Кућа на селу је веома пространа.'),
+('Људи воле музику и игру.');
+----
+
+The tekstovi table now has several rows where the text is entered in Cyrillic. For example:
+
+- id=1: "Београд је главни град Србије."
+- id=2: "Нови Сад је други po величини град."
+- id=3: "Ниш је познат по Нишкој тврђави."
+- id=4: "Кућа на селу је веома пространа."
+- id=5: "Људи воле музику и игру."
+
+[NOTE,title="Note"]
+In these examples, we use simple sentences for illustration. In a real scenario, the text may be longer or more complex.
+
+== Solution through Transliteration (Cyrillic - Latin)
+
+To enable searching regardless of the script used for input, it is essential to unify the script of the text and the query before comparison. One approach is to transliterate the Cyrillic text into the corresponding Latin version (or vice versa). In this PoC solution, we will choose the transliteration of Cyrillic to Latin, considering that the Latin form is suitable for searching (and possibly for applying unaccent removal of diacritics).
+
+== Function for Transliteration of Cyrillic to Latin
+
+PostgreSQL does not have a built-in function for transliteration between scripts, but we can define this functionality ourselves. The simplest way is to use a series of string replacement functions (`translate` and `replace`) according to the rules of Serbian transliteration. The official Serbian Latin script has a direct correspondence with Cyrillic (one Cyrillic grapheme corresponds to one Latin one, except for the digraphs Lj, Nj, Dž which are written with two letters in Latin).
+
+Example implementation of the transliteration function:
+
+[source,sql]
+----
+CREATE OR REPLACE FUNCTION cyrillic_to_latin(p_text TEXT)
+RETURNS TEXT AS $$
+BEGIN
+    -- 1. Convert the entire text to lowercase for consistency in searching
+    p_text := LOWER(p_text);
+    -- 2. Replacements for digraphs (Cyrillic letters that correspond to two letters in Latin)
+    p_text := REPLACE(p_text, 'љ', 'lj');
+    p_text := REPLACE(p_text, 'њ', 'nj');
+    p_text := REPLACE(p_text, 'џ', 'dž');
+    -- 3. Transliteration of other one-to-one letters
+    p_text := TRANSLATE(
+        p_text,
+        'абвгдђежзијклмнопрстћуфхцчш',   -- Cyrillic letters
+        'abvgdđežzijklmnoprstćufhcčš'    -- corresponding Latin letters
+    );
+    RETURN p_text;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+----
+
+Explanation:
+
+. The text is first converted to lowercase (so that the search is case-insensitive without additional complications).
+. Then we replace specific Cyrillic letters: **љ, њ, џ** with their two-letter Latin equivalents (*lj, nj, dž*). We do this before the translate function because translate performs character-by-character mapping and cannot directly produce multiple letters from one.
+. Finally, we use `TRANSLATE` to replace the remaining Cyrillic letters with their Latin counterparts. In the above example, all standard letters of the Serbian Cyrillic script are covered: e.g. `'д'->'d'`, `'ђ'->'đ'`, `'ж'->'ž'`, `'ч'->'č'`, `'ш'->'š'`, `'ћ'->'ć'`, etc. This gives us the Latin text.
+
+[NOTE,title="Note"]
+The function is marked as IMMUTABLE because it always returns the same output for a given input, which allows its use in indexes.
+
+== Example Query: Substring Search with `ILIKE` and Transliteration
+
+Now that we have a function for transliteration, we can search the content regardless of the script. The idea is to transliterate both the text in the database and the user's query to the same form (Latin), and then apply the `ILIKE` operator for case-insensitive substring searching.
+
+Suppose a user wants to find all texts containing the word "град" (in Cyrillic) or "grad" (in Latin). In our table, we know that the first two rows contain the word "град" (once as part of the word "град" standalone, the second time in "град." at the end of the sentence). We will demonstrate two ways of using the query – directly and with transliteration:
+
+
+.(a) Search with Cyrillic query (without transliteration):
+
+[source,sql]
+----
+-- We are looking for the substring "град" directly in the Cyrillic text
+SELECT * FROM tekstovi WHERE cyrillic_content ILIKE '%град%';
+----
+Result: this query will find rows where the Cyrillic string "град" appears. In our dataset, this will return:
+
+- id=1: "Београд је главни *град* Србије."
+- id=2: "Нови Сад је drugi po величини *град*."
+
+(This works because both the data and the query are in Cyrillic, so the comparison can be done directly.)
+
+.(b) Search with Latin query using transliteration:
+
+[source,sql]
+----
+-- We are looking for the substring "grad" in the Cyrillic text, using the transliteration function
+SELECT id, cyrillic_content
+FROM tekstovi
+WHERE cyrillic_to_latin(cyrillic_content) ILIKE '%' || cyrillic_to_latin('grad') || '%';
+
+----
+
+Here we do the following:
+
+- `cyrillic_to_latin(cyrillic_content)`: transliterates the content of each row to Latin.
+- `cyrillic_to_latin('grad')`: transliterates the query `'grad'`. Since `'grad'` is already a Latin string, our function will mostly leave it as is (the function only transliterates Cyrillic letters, Latin letters remain intact). So the result is still "grad".
+- Then we use `ILIKE '%...%'` for substring matching.
+
+The query effectively compares the Latin version of the text with the Latin query. This ensures that Cyrillic texts containing "град" will be found through the Latin query "grad". The result of this query should be identical to that in case (a), returning rows id=1 and id=2.
+
+Verification: Will the above query actually find "Београд"?
+
+- The content "Београд је главни град Србије." transliterates to "beograd je glavni grad srbije."
+- The query "grad" remains "grad".
+- Does "beograd je glavni grad srbije." `ILIKE '%grad%'`? Yes – the string "grad" appears as part of "Beograd" and as a separate word "grad". Since `ILIKE` is not restricted to whole words, it finds "grad" even within larger words (substring). Thus, this query will even return the row id=1, as "Beograd" contains "grad" as its suffix. (This behavior may or may not be desirable – in this example it is, as we consider "Beograd" relevant since it contains "grad".)
+
+Using a transliterated column: An alternative solution (instead of using the function in the `WHERE` clause) is to *add a column* with the transliterated content and maintain its content through triggers or periodic updates. For example:
+
+[source,sql]
+----
+ALTER TABLE tekstovi ADD COLUMN sadrzaj_lat TEXT;
+UPDATE tekstovi SET sadrzaj_lat = cyrillic_to_latin(cyrillic_content);
+
+-- Now we can directly search the Latin column:
+SELECT id, cyrillic_content
+FROM tekstovi
+WHERE sadrzaj_lat ILIKE '%grad%';
+----
+
+This approach duplicates the data but simplifies and speeds up the queries (as the function is not executed for each row during the search). The cleanest solution would be to not duplicate the data but to index the transliterated value. PostgreSQL supports expression indexes, so we can create an index on the expression `cyrillic_to_latin(cyrillic_content)`. This way, even without an additional column, the result of the function can be indexed.
+
+
+Indexing for `ILIKE`: Searching with the `ILIKE '%...%'` operator usually does not use a B-tree index, but results in a sequential scan through all the data, which is slow for large tables. However, PostgreSQL's `pg_trgm` extension (trigram index) allows indexing of substrings to speed up such queries. We must first enable the extension:
+
+[source,sql]
+----
+CREATE EXTENSION pg_trgm;
+----
+
+Then we can create a GIN index on the transliterated content, using trigram operators:
+
+[source,sql]
+----
+CREATE INDEX idx_tekst_lat_trgm
+ON tekstovi
+USING gin ( cyrillic_to_latin(cyrillic_content) gin_trgm_ops );
+----
+
+This index stores trigrams (three-letter groups) of the Latin text. Now a query with `ILIKE` can use this index. Instead of an expensive sequential scan of all rows, PostgreSQL will quickly find candidates containing the requested substring through the trigram index. This drastically improves performance on larger datasets – a simple `ILIKE` is easy to implement but doesn't scale well https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Full[promer], while the trigram index significantly speeds up such searches https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Creating%20a%20trigram%20index%20can,query[primer].
+
+[NOTE,title="Example"]
+After creating the index, the query (b) above would internally use a Bitmap Index Scan over the trigram index instead of a Seq Scan. For a very large table, the difference can be from scanning a million rows to scanning a few thousand candidates.
+
+[NOTE,title="Note"]
+`pg_trgm` index works for Unicode text (Cyrillic, Latin, it doesn't matter, it just looks at byte sequences). In our case, we insist on transliteration to have a single script in the index. We could have also indexed the Cyrillic text directly with trigram (then the Latin query would have to be first transliterated to Cyrillic, which is more complex due to possible ambiguities). A unique strategy of transliterating everything to Latin has proven to be simpler.
+
+== Removing Diacritics (`unaccent`)
+Another aspect of the search is the treatment of diacritical marks (č, ć, š, ž, đ). Often users will not enter the accent (e.g., kuca instead of kuća) or vice versa. PostgreSQL offers the unaccent extension which removes diacritics from the text. This extension can be applied together with our transliteration to further ensure matching even when diacritics do not match.
+
+To use it, let's enable it:
+
+[source,sql]
+----
+CREATE EXTENSION unaccent;
+----
+
+`unaccent` function converts, for example, "č" to "c", "š" to "s", "đ" to "dj" (or "d", depending on the rules), etc. We can incorporate `unaccent` into our transliteration function or into the query itself. For example:
+
+[source,sql]
+----
+SELECT *
+FROM tekstovi
+WHERE unaccent( cyrillic_to_latin(cyrillic_content) ) ILIKE unaccent( cyrillic_to_latin('kuca') );
+----
+
+This query would find the text "кућа" (Cyrillic with diacritic) for the query "kuca" (Latin without diacritic), because:
+
+- "кућа" transliterated gives "kuća",
+- `unaccent` further turns "kuća" into "kuca",
+- The query "kuca" transliterated remains "kuca",
+- Both sides of the `ILIKE` comparison become "kuca".
+
+== Full-text search (FTS) with Transliteration
+
+Another approach to searching text content is using the *PostgreSQL Full-Text Search (FTS)* mechanism. Full-text search is suitable for searching *by words/terms* with the possibility of ranking results by relevance, including synonyms, stop words, etc. Also, FTS uses indexes (*TSVECTOR*) that are optimized for text searching.
+
+=== Preparing the Column for FTS (tsvector)
+
+To utilize FTS, a column of type *TSVECTOR* is often added, containing pre-indexed terms from the text. We can populate this column with transliterated text to unify the script.
+
+First, let's create the column and update it with the transliterated text in the form of tsvector:
+
+[source,sql]
+----
+ALTER TABLE tekstovi ADD COLUMN tsv SEARCH tsvector;
+
+-- Populating the TSVEKTOR column using to_tsvector on the transliterated text
+UPDATE tekstovi
+SET tsv = to_tsvector('simple', cyrillic_to_latin(cyrillic_content));
+----
+
+We use the `'simple'` configuration (built into PG) for tsvector, which practically just tokenizes the text into words and converts to lowercase, without language-specific normalization (since there is no built-in one for Serbian). Now the `tsv` column contains, for each row, the indexed Latin words of the original Cyrillic text.
+
+Example:
+
+- For row 1 ("Београд је главни град Србије.") the transliteration is "beograd je glavni grad srbije." Simple tsvector will break this into tokens: `'beograd' 'glavni' 'grad' 'je' 'srbije'`.
+- For row 3 ("Ниш је познат по Нишкој тврђави.") -> "niš je poznat po niškoj tvrdjavi." (here `đ` in "tvrđavi" we transliterate as "dj" or "đ"; let's say our function gives "tvrdjavi" with "dj". Simple tokenizer will have: 'nis', 'je', 'poznat', 'po', 'niskoj', 'tvrdjavi'.)
+
+Let's create a GIN index on this column to speed up the search:
+
+[source,sql]
+----
+CREATE INDEX idx_tekst_tsv ON tekstovi USING GIN(tsv);
+----
+
+=== Searching with TSQUERY (full-text)
+
+Now we can perform queries using the `@@` operator which checks if the TSVEKTOR contains the given TSQUERY (query). It is important to apply the same transliteration procedure to the user query to form the corresponding tsquery. The easiest way is to transliterate the query and then use the `plainto_tsquery` or `to_tsquery` function with the same `'simple'` configuration.
+
+Suppose again that the user is looking for "grad". To capture both Cyrillic and Latin variants, we will transliterate the query (if it is in Cyrillic, it will become "grad"; if it is already in Latin, it remains "grad"). Then:
+
+[source,sql]
+----
+-- Suppose the user query is in the variable :query
+-- 1. Transliterating it to Latin:
+SELECT plainto_tsquery('simple', cyrillic_to_latin(:query)) AS ts_upit;
+----
+
+This query will return all rows where the word "grad" appears (or as part of some more complex word if we used the prefix operator). In our example, it will find rows 1 and 2.
+
+Difference from ILIKE: Full-text search looks for matches at the level of whole words or prefixes, not arbitrary substrings. This means that:
+
+- The word "Beograd" will not be found if the query is "grad" (because "grad" is not a prefix of "beograd", nor a whole word – FTS does not capture suffixes by default).
+- Unlike `ILIKE '%grad%'` which would find "Beograd" as well, full-text would only find it if the user entered a prefix query like `"Beograd":*` or similar.
+
+However, full-text search is stronger in other aspects:
+
+- Ignores frequent irrelevant words (if we used a language configuration with a stop-list, e.g., the word "je" would be ignored).
+- Can be extended to stemming (e.g., for English "running" matches "run"), while for Serbian we do not have an immediate stemmer available in PG, but we could potentially integrate the snowball stemmer for Croatian or similar).
+- Ranking results: with the `ts_rank` function we can rank documents by how often and where the query appeared.
+- Efficiency on large texts: FTS index is very fast for searching by words, regardless of the length of the text.
+
+If we want the full-text search to also be insensitive to diacritics, we can integrate the `unaccent` filter into the text search configuration. For example, we create a custom configuration for Serbian:
+
+[source,sql]
+----
+-- Creating a text search configuration that includes unaccent
+CREATE TEXT SEARCH CONFIGURATION serbian ( COPY = simple );
+ALTER TEXT SEARCH CONFIGURATION serbian
+    ALTER MAPPING FOR hword, hword_part, word
+    WITH unaccent, simple;
+----
+
+Now `to_tsvector('serbian', tekst)` first removes diacritics and then tokenizes. In our `tsv` column, we could use the `'serbian'` configuration which uses `unaccent`, or simply embed the `unaccent` call:
+
+[source,sql]
+----
+UPDATE tekstovi
+SET tsv = to_tsvector('simple', unaccent(cyrillic_to_latin(cyrillic_content)));
+----
+
+This way, for example, "Niš" in the index would be represented as "nis", and the query "nis" would find it. On the other hand, "šuma" would be indexed as "suma", so the query "suma" returns "šuma" as well. This confirms that diacritic insensitivity has its *downsides* (it can merge different words), so adjust this to your needs.
+
+=== Example of a full-text query
+
+Suppose we want to find all texts containing the word "музику" or "muziku". This is the word "музику" (accusative of "музика") in Cyrillic. Transliterating gives "muziku".
+
+The query can be constructed as follows:
+
+[source,sql]
+----
+SELECT id, cyrillic_content
+FROM tekstovi
+WHERE tsv @@ plainto_tsquery('simple', cyrillic_to_latin('музику'));
+----
+
+or equivalently for Latin input:
+
+[source,sql]
+----
+SELECT id, cyrillic_content
+FROM tekstovi
+WHERE tsv @@ plainto_tsquery('simple', cyrillic_to_latin('музику'));
+----
+
+Both will translate the query to `'muziku'` tsquery and find documents where this word appears. In our dataset, row 5 contains "музику", so it will be returned.
+
+== Comparing Approaches and Performance
+
+. `ILIKE` + transliteration (substring search):
+- *Advantages*: Easy to understand and implement. Works for parts of words or phrases – i.e., can find a substring anywhere in the text. Works immediately without the need for special data preparation (unless using an additional column or index for speeding up). Also, ILIKE can easily work with different patterns (e.g., multiple conditions for different terms can be combined).
+- *Disadvantages*: For large tables, a simple ILIKE search requires a full sequential pass through the data and comparison of each row, which is slow https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Full[izvor emplocity.com]. This scaling can be significantly improved with a trigram index (pg_trgm), at the cost of additional space and some time to maintain the index. With a trigram index, ILIKE queries become very fast even for partial matches. However, it still lacks an understanding of the linguistic basis – the search is technically "shallower", knows nothing of whole words, prefixes, or suffixes, but just looks at sequences of characters.
+- *Note* on transliteration: Introducing our function cyrillic_to_latin adds a slight overhead per query. If we index it (as an expression) or use an additional column, this overhead is eliminated in the query itself (it is paid for when updating the data or building the index).
+. Full-text search (TSVECTOR/TSQUERY):
+- *Advantages*: Designed for fast searching in *large text corpora*. GIN index on TSVECTOR allows very fast lookups by words. Full-text search breaks the text into words (lexeme) and can ignore common words (like "je", "i", "na" – if we add them to the stop list), meaning queries will not unnecessarily return documents just because they contain insignificant words. There is a possibility of linguistic processing (e.g., for English and other languages: stemming, synonyms, etc.), making the search *"smarter"* – e.g., the query "gradovi" could find documents with the word "grad" if a Serbian stemmer existed.
+- *Disadvantages*: Full-text search is by definition *word-based*. This means we cannot simply find an arbitrary substring in the middle of a word. If a user enters part of a word that is not a prefix, the result may be missing. In our example, "grad" as a query will not find "Beograd" via FTS (unless we specifically enable prefix query or break words into even smaller parts, which is not standard practice). Thus, FTS is excellent for scenarios where *whole terms* or prefixes are sought.
+- *Complexity*: Setting up FTS requires a bit more initial work (creating a tsvector column or functional index, maintaining it after insert/update operations, etc.). However, once set up, usage is quite simple through the `@@` operator.
+- *Space*: TSVECTOR index can be large if texts contain many unique words. There should be a balance between the need for speed and space.
+- *Note on transliteration*: In our approach, transliteration is embedded before indexing, so the FTS index in the database already contains Latin terms. An alternative solution would be to keep two sets of tokens (both Cyrillic and Latin) in the tsvector – this would increase space, so we opted for transliteration. It is also possible to *not use transliteration:* configure a special text search dictionary that maps Cyrillic words to Latin as synonyms. That would be elegant but requires more complex setup (creating a custom dictionary). In practice, the transliteration approach is efficient enough.
+
+Performance comparison:
+
+- On a small amount of data (a few hundred rows), differences will not be noticeable – any method will be fast. As the data grows to several thousand or millions of rows, *the difference is significant*.
+- _ILIKE without index_: performance decreases linearly; each additional row means one more comparison. E.g., 100k rows and text ~100 words, a simple ILIKE query can take tens of milliseconds or more (as noted in one test, ~87 ms for 100k rows https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=13%20Limit%20%20%28cost%3D0,193%20ms[emplocity.com]).
+- _ILIKE with `pg_trgm`_: almost constant time for finding substring matches, even in millions of rows, provided the pattern is not too short/common. The index quickly filters candidates. The cost is that text modification means updating the index (which is quite optimized in PG, but there is a cost).
+- _FTS (GIN index on TSVECTOR)_: very fast searches by words; adding a document to the index also carries a cost. For queries that match a large number of documents, FTS can quickly return all (and can rank them). FTS has the advantage of being able to search for multiple words at once, phrases, logical operations (AND/OR/NEAR), etc. It also strikes a good balance between speed and the ability for more precise language-based searches https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=,you%20should%20choose%20tsearch%20engine[emplocity.com] (morphologically richer searches).
+
+Limitations specific to the Serbian language:
+
+- There is no ready-made *stemmer* or *dictionary* for Serbian in the standard PG distribution. This means that FTS does not automatically lemmatize Serbian words. A possible solution for more advanced needs is to integrate external libraries or use, e.g., the Croatian stemmer (given the language similarity) with caution.
+- Transliterating works correctly for standard situations. However, if a user enters Latin text containing the digraphs "lj", "nj", "dž" thinking of individual Cyrillic letters, our function does not "return" it to Cyrillic but works only in one direction (Cyrillic->Latin). In the PoC, we covered the Cyrillic->Latin scenario as it is needed for searching; the reverse would only be necessary if we were to keep the index in Cyrillic and wanted to transliterate the Latin query to Cyrillic. We did not do this as it is more complex to determine reliably (e.g., "nj" in a Latin query means "њ" or "н"+"ј"? – it would have to be decided contextually).
+
+
+== Next Steps Toward Implementation in Elixir/Ecto Environment
+
+Since the PoC is realized at the PostgreSQL level, integration into an Elixir application (with Ecto ORM) can be achieved with a few recommendations:
+
+.Creation of extensions and functions through migrations:
+In Ecto migrations, you can add steps to create the necessary extensions (`unaccent`, `pg_trgm`) and create the function `cyrillic_to_latin`. For example, in the migration file add
+
+[source,elixir]
+----
+execute("CREATE EXTENSION IF NOT EXISTS unaccent;")
+execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+execute(\"""
+  CREATE OR REPLACE FUNCTION public.cyrillic_to_latin(p_text TEXT)
+  RETURNS TEXT AS $$
+  BEGIN
+    -- ... function body ...
+  END; $$ LANGUAGE plpgsql IMMUTABLE;
+\""")
+----
+Ensure that the function is created in the correct schema (we used public in the above example).
+
+.Adding columns/indexes in migrations
+If we go the route of an additional column for transliteration (`sadrzaj_lat` TEXT) and TSVECTOR column, the migration should add that. Also create indexes:
+[source,elixir]
+----
+create index("tekstovi", ["cyrillic_to_latin(cyrillic_content) gin_trgm_ops"], name: "idx_tekst_lat_trgm", using: "GIN")
+create index("tekstovi", ["tsv"], name: "idx_tekst_tsv", using: "GIN")
+----
+
+.Updating columns through the application
+If we use a materialized column `sadrzaj_lat` and `tsv`, it is necessary that with every change to `sadrzaj_cirilic` we automatically update these columns. We can solve this with a trigger in PG that calls the transliteration function and `to_tsvector`. Alternatively, upon insert/update from the Elixir application, we can explicitly set these columns by calling the function in SQL. For example, in Ecto we can use a fragment in the changeset:
+
+[source,elixir]
+----
+changeset
+|> put_change(:cyrillic_content, unos)
+|> put_change(:sadrzaj_lat, fragment("cyrillic_to_latin(?)", unos))
+|> put_change(:tsv, fragment("to_tsvector('simple', cyrillic_to_latin(?))", unos))
+----
+With this approach, we rely on the database to calculate the values of the derived columns.
+
+.Usage in searches (Ecto queries)
+Ecto allows writing fragments for specific SQL parts. For example, for substring search we could have an Ecto query:
+
+[source,elixir]
+----
+search_term = "grad"  # or "град"
+Repo.all(from t in Tekstovi,
+         where: fragment("cyrillic_to_latin(cyrillic_content) ILIKE cyrillic_to_latin(?)", ^("%" <> search_term <> "%")),
+         select: t)
+
+----
+
+With this query, we transliterate both the column and the parameter (the parameter will be inserted in place of `?` via the `^` syntax). Alternatively, if we have already stored `sadrzaj_lat`, the query can be:
+
+[source,elixir]
+----
+search_term = "grad"  # or "град"
+Repo.all(from t in Tekstovi,
+         where: fragment("? ILIKE ?", t.sadrzaj_lat, ^("%" <> search_term <> "%")),
+         select: t)
+
+----
+
+noting that, if we want diacritic insensitivity, we can include unaccent(?) around those fragments in a similar way.
+
+For full-text search, Ecto fragment could look like:
+[source,elixir]
+----
+Repo.all(from t in Tekstovi,
+         where: fragment("? @@ plainto_tsquery('simple', cyrillic_to_latin(?))", t.tsv, ^search_term),
+         select: t)
+
+----
+
+where `search_term` is the user input. (Of course, in practice, we might also add `unaccent` here in the definition of the TSVEKTOR index for complete coverage.)
+
+
+.Testing
+
+After integration, test various search scenarios:
+
+- Input in Cyrillic that has an exact match.
+- Input in Latin with diacritical marks (e.g., "Niš") and without (e.g., "Nis") and check if both return as expected.
+- Searching for multiple words at once (e.g., "главни град" or "glavni grad") in both modes.
+- Performance test on a larger dataset (generate e.g. a few tens of thousands of rows) to verify that the trigram index and FTS index provide the expected speedups.
+
+== Conclusion
+
+The proposed PoC solution demonstrates how transliterating Cyrillic content can achieve unified search functionality for both Serbian scripts. We have shown two complementary approaches:
+
+- *ILIKE + transliteration + trigram index* for flexible substring searching,
+- *Full-text search* for fast and linguistically aware word searching.
+
+Through SQL examples, we have seen that PostgreSQL, with the help of small adjustments (functions, extensions, indexes), can independently solve this problem without involving external tools. Transliterating is the heart of the solution – it enables the user's query and the text in the database to be brought to a common denominator before comparison.
+
+For a comprehensive production solution, it is recommended to:
+
+- *Validate the approach*: Check if the transliteration covers all relevant user input cases in the domain application. Adjust the rules if necessary (e.g., allow "dj" in Latin to be accepted as "đ", etc.).
+- *Index as needed*: If queries are mostly simple and the database is not huge, maybe just ILIKE is sufficient (or at least add a trigram index). For more complex queries with multiple terms, FTS is likely more efficient.
+- *Maintain transliterated columns*: Decide on a method (trigger vs. application level) and ensure no input misses the update.
+- *Elixir integration*: Thoroughly test Ecto queries with fragments and consider encapsulating these fragments in functions or even custom Ecto type/adapters for cleaner code. For example, an Ecto fragment could be made through a macro for ilike_cirilica(field, ^term) that automatically does the necessary transliteration.
+- *Performance tests*: Compare performance on the target volume of data, as this will determine whether to use one or both solutions in combination. For some systems, trigram search is sufficient; for others, the power of full-text search is needed (e.g., when searching long documents or needing a ranked list of results).
+
+With this PoC and the outlined guidelines, the next step is implementation in the application itself. PostgreSQL shows it is "smart enough" to enable searching Cyrillic content even via Latin script, providing users with search flexibility without compromising data integrity. This solution is a good foundation that can be further built upon (e.g., by adding support for more languages or scripts if needed, or integrating with Elixir text processing before queries).
+
+References:
+
+- Martin Kováčik, "How to do transliteration in PostgreSQL" – describes a requirement similar to ours (Russian Cyrillic and Latin) and proposes a function for transliteration and indexing.
+- Jarosław Orzeł, "How to build PostgreSQL full text search engine in any language" – shows examples of using ILIKE, trigram indexes, and tsearch, with performance comparison (https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Full[izvor], https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=Creating%20a%20trigram%20index%20can,query[izvor], https://emplocity.com/en/about-us/blog/how_to_build_postgresql_full_text_search_engine_in_any_language/#:~:text=,you%20should%20choose%20tsearch%20engine[izvor])
+- PostgreSQL documentation (official docs) – for unaccent module and pg_trgm module.
